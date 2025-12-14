@@ -94,6 +94,9 @@ def normalize_href(base_url: str, href: str) -> str | None:
 # ============================================================
 # BASE EXTRACTOR — shared utilities
 # ============================================================
+import re
+from typing import Optional, Tuple
+
 class BaseExtractor:
     # ---------------------------- SAFE WAIT HELPERS ----------------------------
     async def safe_networkidle(self, page, timeout_ms: int = 8000):
@@ -102,6 +105,315 @@ class BaseExtractor:
         except:
             pass
 
+    async def _try_click_apply(self, page):
+        """
+        Some UIs require Apply/Done/Show results after selecting location.
+        Best-effort click.
+        """
+        btn = page.locator("""
+            button:has-text("Apply"),
+            button:has-text("Done"),
+            button:has-text("Show results"),
+            button:has-text("Update"),
+            button:has-text("Search")
+        """).first
+        try:
+            if await btn.count() > 0 and await btn.is_visible():
+                await btn.click()
+                await self.safe_networkidle(page)
+        except:
+            pass
+
+    async def _clear_input(self, page, loc):
+        try:
+            await loc.click()
+            # Windows/Linux
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+        except:
+            try:
+                # macOS fallback
+                await page.keyboard.press("Meta+A")
+                await page.keyboard.press("Backspace")
+            except:
+                # last resort
+                try:
+                    await loc.fill("")
+                except:
+                    pass
+
+    async def _type_united_and_select_us(
+        self,
+        page,
+        input_locator,
+        query: str = "United",
+        target_pattern: str = r"\bUnited States\b",
+        type_delay_ms: int = 120,
+        suggestion_timeout_ms: int = 8000,
+    ) -> bool:
+        """
+        Types only 'United' (or your query), then selects 'United States' from suggestions.
+        Does NOT type 'States' unless you change the query.
+
+        Returns True if it clicked the 'United States' suggestion.
+        """
+        await self._clear_input(page, input_locator)
+
+        # Type like a user (triggers key events / debounce)
+        try:
+            await input_locator.type(query, delay=type_delay_ms)
+        except:
+            await page.keyboard.type(query, delay=type_delay_ms)
+
+        # Wait for suggestion list to appear
+        options = page.locator("li[role='option'], div[role='option']")
+        try:
+            await options.first.wait_for(state="visible", timeout=suggestion_timeout_ms)
+        except:
+            return False
+
+        # Click specifically "United States" if present
+        us = options.filter(has_text=re.compile(target_pattern, re.I)).first
+        if await us.count() > 0:
+            try:
+                await us.click()
+                await self.safe_networkidle(page)
+                return True
+            except:
+                return False
+
+        # Suggestions exist but US not present -> do NOT press Enter blindly here
+        return False
+
+    # ---------------------------- LOCATION FILTER DETECTION (IMPROVED) ----------------------------
+    async def apply_location_filter(self, page) -> bool:
+        print("\n🔍 Checking for location filter UI...\n")
+
+        async def select_us_from_input(input_locator) -> bool:
+            # Type 'United' and select 'United States' if it appears
+            picked = await self._type_united_and_select_us(
+                page,
+                input_locator,
+                query="United",
+                target_pattern=r"\bUnited States\b",
+                type_delay_ms=120,
+                suggestion_timeout_ms=8000,
+            )
+
+            if picked:
+                await self._try_click_apply(page)
+                await self.safe_networkidle(page)
+                return True
+
+            # Fallback: some widgets accept free text
+            try:
+                await page.keyboard.press("Enter")
+                await self._try_click_apply(page)
+                await self.safe_networkidle(page)
+                return True
+            except:
+                return False
+
+        # 0) Best case: <label for="...">Location</label> -> input#...
+        label = page.locator("label:has-text('Location')").first
+        try:
+            if await label.count() > 0 and await label.is_visible():
+                for_id = await label.get_attribute("for")
+                if for_id:
+                    target = page.locator(f"#{for_id}").first
+                    if await target.count() > 0 and await target.is_visible():
+                        print("📍 Location input found via label[for] association")
+                        return await select_us_from_input(target)
+        except:
+            pass
+
+        # 1) Basic <input>
+        selectors = [
+            "input[placeholder*='location' i]",
+            "input[aria-label*='location' i]",
+            "input[name*='location' i]",
+            "input[id*='location' i]"
+        ]
+        for sel in selectors:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() > 0 and await loc.is_visible():
+                    print(f"📍 Location filter found: {sel}")
+                    return await select_us_from_input(loc)
+            except:
+                continue
+
+        # 2) Checkbox-style location panel
+        # Try clicking a label that contains "United States" (common in facet filters)
+        try:
+            checkbox_label = page.locator("""
+                label:has-text("United States"),
+                div:has(label:has-text("United States"))
+            """).first
+
+            if await checkbox_label.count() > 0 and await checkbox_label.is_visible():
+                print("📍 Location checkbox option found: United States")
+                try:
+                    await checkbox_label.click()
+                except:
+                    # fallback: click/check the first checkbox in that area
+                    cb = page.locator("input[type='checkbox']").first
+                    if await cb.count() > 0:
+                        await cb.check()
+
+                await self._try_click_apply(page)
+                await self.safe_networkidle(page)
+                return True
+        except:
+            pass
+
+        # 3) React / JS widgets — try to scope to Location first
+        react_selectors = [
+            "div:has-text('Location') [role='combobox']",
+            "div[aria-label*='location' i] [role='combobox']",
+            "button[aria-label*='location' i]",
+            "div[aria-label*='location' i]",
+            "[role='combobox']"  # broad fallback LAST
+        ]
+
+        for sel in react_selectors:
+            widget = page.locator(sel).first
+            try:
+                if await widget.count() > 0 and await widget.is_visible():
+                    print(f"📍 React widget found: {sel}")
+                    try:
+                        await widget.click()
+                    except:
+                        pass
+
+                    # After opening, try the active text input
+                    input_box = page.locator("input[type='text'], input").first
+                    if await input_box.count() > 0 and await input_box.is_visible():
+                        return await select_us_from_input(input_box)
+            except:
+                continue
+
+        # 4) <select> dropdown
+        dropdowns = [
+            "select[name*='location' i]",
+            "select[aria-label*='Location' i]"
+        ]
+        for sel in dropdowns:
+            box = page.locator(sel).first
+            try:
+                if await box.count() > 0 and await box.is_visible():
+                    print(f"📍 Dropdown found: {sel}")
+                    try:
+                        await box.select_option(label="United States")
+                    except:
+                        try:
+                            await box.select_option(value="US")
+                        except:
+                            return False
+
+                    await self._try_click_apply(page)
+                    await self.safe_networkidle(page)
+                    return True
+            except:
+                continue
+
+        print("❌ No location filter detected.\n")
+        return False
+    
+    async def _type_prefix_search_and_submit(
+    self,
+    page,
+    search_input,
+    query: str,
+    prefix_len: int = 4,
+    type_delay_ms: int = 70,
+    suggestion_timeout_ms: int = 3000,
+    results_timeout_ms: int = 8000,
+    strict_suggestion: bool = True, 
+) -> bool:
+            """
+            Job search helper:
+            - Clears the search input
+            - Types only a prefix first (default 4 chars)
+            - If suggestions appear and one matches the FULL query -> click it
+            - Otherwise types the rest of the query and presses Enter
+            - Enter is only pressed after the full query is present in the input
+
+            Returns True if it attempted the search.
+            """
+            if not query:
+                return False
+
+            # focus + clear
+            try:
+                await self._clear_input(page, search_input)
+            except:
+                try:
+                    await search_input.click()
+                except:
+                    return False
+
+            prefix_len = max(1, min(prefix_len, len(query)))
+            prefix = query[:prefix_len]
+            rest = query[prefix_len:]
+
+            # type prefix like a user
+            try:
+                await search_input.type(prefix, delay=type_delay_ms)
+            except:
+                try:
+                    await page.keyboard.type(prefix, delay=type_delay_ms)
+                except:
+                    return False
+
+            options = page.locator("li[role='option'], div[role='option']")
+            clicked_suggestion = False
+
+            # wait briefly for suggestions; if present try to click the best match
+            try:
+                await options.first.wait_for(state="visible", timeout=suggestion_timeout_ms)
+
+                # ✅ only click if exact match (ignoring case + extra spaces)
+                if strict_suggestion:
+                    want = re.sub(r"\s+", " ", query).strip().lower()
+
+                    # check first N suggestions (avoid scanning hundreds)
+                    n = min(await options.count(), 25)
+                    for i in range(n):
+                        opt = options.nth(i)
+                        txt = (await opt.inner_text() or "").strip()
+                        got = re.sub(r"\s+", " ", txt).strip().lower()
+
+                        if got == want:
+                            await opt.click()
+                            clicked_suggestion = True
+                            break
+                else:
+                    # non-strict mode (contains match) — not recommended for your case
+                    best = options.filter(has_text=re.compile(re.escape(query), re.I)).first
+                    if await best.count() > 0:
+                        await best.click()
+                        clicked_suggestion = True
+            except:
+                pass
+
+            # If we didn't click a suggestion, finish typing full query then Enter
+            if not clicked_suggestion:
+                if rest:
+                    try:
+                        await search_input.type(rest, delay=type_delay_ms)
+                    except:
+                        await page.keyboard.type(rest, delay=type_delay_ms)
+
+                try:
+                    await page.keyboard.press("Enter")
+                except:
+                    return False
+
+            # Let results load
+            await page.wait_for_timeout(250)
+            await self.safe_networkidle(page, timeout_ms=results_timeout_ms)
+            return True
     # ---------------------------- SEARCH BOX DETECTION ----------------------------
     async def find_search_box(self, page):
         selectors = [
@@ -117,118 +429,6 @@ class BaseExtractor:
                 print(f"🔎 Search box found: {sel}")
                 return el.first
         return None
-
-    # ---------------------------- LOCATION FILTER DETECTION (IMPROVED) ----------------------------
-    async def apply_location_filter(self, page):
-        print("\n🔍 Checking for location filter UI...\n")
-
-        # 0) Best case: <label for="...">Location</label> -> input#...
-        label = page.locator("label:has-text('Location')").first
-        try:
-            if await label.count() > 0 and await label.is_visible():
-                for_id = await label.get_attribute("for")
-                if for_id:
-                    target = page.locator(f"#{for_id}").first
-                    if await target.count() > 0 and await target.is_visible():
-                        print("📍 Location input found via label[for] association")
-                        await target.click()
-                        await target.fill("United States")
-                        await page.wait_for_timeout(300)
-
-                        suggestion = page.locator("li[role='option'], div[role='option']")
-                        if await suggestion.count() > 0:
-                            await suggestion.first.click()
-                        else:
-                            await page.keyboard.press("Enter")
-
-                        await self.safe_networkidle(page)
-                        return True
-        except:
-            pass
-
-        # 1) Basic <input>
-        selectors = [
-            "input[placeholder*='location' i]",
-            "input[aria-label*='location' i]",
-            "input[name*='location' i]",
-            "input[id*='location' i]"
-        ]
-
-        for sel in selectors:
-            loc = page.locator(sel).first
-            if await loc.count() > 0 and await loc.is_visible():
-                print(f"📍 Location filter found: {sel}")
-                await loc.click()
-                await loc.fill("United States")
-                await page.wait_for_timeout(300)
-
-                suggestion = page.locator("li[role='option'], div[role='option']")
-                if await suggestion.count() > 0:
-                    print("📌 Selecting first suggested US location...")
-                    await suggestion.first.click()
-                else:
-                    print("⚠ No suggestions → pressing Enter")
-                    await page.keyboard.press("Enter")
-
-                await self.safe_networkidle(page)
-                return True
-
-        # 2) React / JS combobox components (still broad, but kept as fallback)
-        react_selectors = [
-            "div[aria-label*='location' i] [role='combobox']",
-            "button[aria-label*='location' i]",
-            "div[aria-label*='location' i]",
-            "[role='combobox']"
-        ]
-
-        for sel in react_selectors:
-            widget = page.locator(sel).first
-            if await widget.count() > 0 and await widget.is_visible():
-                print(f"📍 React widget found: {sel}")
-                try:
-                    await widget.click()
-                except:
-                    pass
-                await page.wait_for_timeout(250)
-
-                input_box = page.locator("input[type='text'], input").first
-                if await input_box.count() > 0 and await input_box.is_visible():
-                    await input_box.fill("United States")
-                    await page.wait_for_timeout(250)
-
-                    suggestion = page.locator("li[role='option'], div[role='option']")
-                    if await suggestion.count() > 0:
-                        print("📌 Selecting suggestion...")
-                        await suggestion.first.click()
-                    else:
-                        await page.keyboard.press("Enter")
-
-                    await self.safe_networkidle(page)
-                    return True
-
-        # 3) <select> dropdown
-        dropdowns = [
-            "select[name*='location' i]",
-            "select[aria-label*='Location' i]"
-        ]
-
-        for sel in dropdowns:
-            box = page.locator(sel).first
-            if await box.count() > 0 and await box.is_visible():
-                print(f"📍 Dropdown found: {sel}")
-                try:
-                    await box.select_option(label="United States")
-                except:
-                    # fallback: sometimes values are like "US"
-                    try:
-                        await box.select_option(value="US")
-                    except:
-                        return False
-                await self.safe_networkidle(page)
-                return True
-
-        print("❌ No location filter detected.\n")
-        return False
 
     # ---------------------------- PAGINATION HELPERS ----------------------------
     async def _next_locator(self, page):
@@ -248,12 +448,11 @@ class BaseExtractor:
         except:
             return False
 
-    async def click_next(self, page, prev_signature: str | None = None) -> tuple[bool, str | None]:
+    async def click_next(self, page, prev_signature=None):
         btn = await self._next_locator(page)
         if await btn.count() == 0:
             return (False, prev_signature)
 
-        # check disabled-ish state
         try:
             if not await btn.is_visible():
                 return (False, prev_signature)
@@ -267,29 +466,29 @@ class BaseExtractor:
         except:
             pass
 
-        # record before click
         old_url = page.url
 
         try:
-            await btn.click()
+            # ✅ ensure it's clickable
+            await btn.scroll_into_view_if_needed()
+            await btn.click(timeout=15000)
         except:
             return (False, prev_signature)
 
-        # safer waits: don't rely on networkidle forever
+        # ✅ Disney sometimes doesn't trigger full navigations; wait for results instead
         try:
-            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            await page.wait_for_selector("a[href*='/en/job/'], a[href*='/job/']", timeout=15000)
         except:
             pass
+
         await self.safe_networkidle(page, timeout_ms=8000)
 
-        # verify change (URL OR signature change)
         new_sig = await self.first_result_signature(page)
         if page.url != old_url:
             return (True, new_sig)
         if prev_signature and new_sig and new_sig != prev_signature:
             return (True, new_sig)
 
-        # no detectable change -> stop
         return (False, new_sig)
 
     async def has_numeric_pagination(self, page) -> bool:
@@ -302,11 +501,9 @@ class BaseExtractor:
         try:
             if await pager.count() == 0:
                 return False
-            # any numeric link visible?
             links = pager.locator("a")
             if await links.count() == 0:
                 return False
-            # quick check: at least one link with digit text
             for i in range(min(await links.count(), 30)):
                 txt = ((await links.nth(i).inner_text()) or "").strip()
                 if txt.isdigit():
@@ -316,9 +513,6 @@ class BaseExtractor:
             return False
 
     async def click_next_page_number(self, page) -> bool:
-        """
-        Clicks current_page + 1 if detectable.
-        """
         pager = page.locator("""
             nav[aria-label*="pagination" i],
             .pagination,
@@ -328,7 +522,6 @@ class BaseExtractor:
         if await pager.count() == 0:
             return False
 
-        # detect current page
         current_num = None
         try:
             cur = pager.locator('[aria-current="page"]').first
@@ -339,7 +532,6 @@ class BaseExtractor:
         except:
             pass
 
-        # gather numeric links
         links = pager.locator("a")
         n = await links.count()
         nums = []
@@ -355,7 +547,6 @@ class BaseExtractor:
         if not nums:
             return False
 
-        # if current not found, assume smallest is current-ish
         if current_num is None:
             current_num = min(x[0] for x in nums)
 
@@ -380,7 +571,6 @@ class BaseExtractor:
             pass
         await self.safe_networkidle(page, timeout_ms=8000)
 
-        # basic change check
         return page.url != old_url or (await self.first_result_signature(page)) is not None
 
     # ---------------------------- SCROLL ----------------------------
@@ -401,10 +591,11 @@ class BaseExtractor:
             await page.wait_for_timeout(500)
 
     # ---------------------------- RESULT SIGNATURE ----------------------------
-    async def first_result_signature(self, page) -> str | None:
+    async def first_result_signature(self, page) -> Optional[str]:
         """
         A lightweight 'did content change?' signal.
         We scan a few anchors and pick the first one that looks like a SWE role.
+        (Assumes is_swe_role() exists in your module.)
         """
         try:
             links = page.locator("a[href]")
@@ -428,9 +619,25 @@ class DirectExtractor(BaseExtractor):
     async def extract(self, page, keywords):
         jobs = []
         seen = set()
-
         base_url = page.url
-        links = page.locator("a[href]")
+
+        # ✅ Fast path: job links only (Disney + many boards)
+        job_link_locators = [
+            "a[href*='/en/job/']",
+            "a[href*='/job/']",
+        ]
+
+        links = None
+        for sel in job_link_locators:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                links = loc
+                break
+
+        # Fallback: scan all anchors only if needed
+        if links is None:
+            links = page.locator("a[href]")
+
         count = await links.count()
 
         for i in range(count):
@@ -448,16 +655,14 @@ class DirectExtractor(BaseExtractor):
                 continue
 
             abs_url = normalize_href(base_url, href)
-            if not abs_url:
+            if not abs_url or abs_url in seen:
                 continue
 
-            if abs_url in seen:
-                continue
             seen.add(abs_url)
-
             jobs.append({"title": text, "url": abs_url})
 
         return jobs
+
 
 
 # ============================================================
@@ -471,12 +676,22 @@ class SearchExtractor(BaseExtractor):
 
         all_results = []
         seen = set()
+        page_no = 1
+
 
         for q in SEARCH_QUERIES:
             try:
-                await search.click()
-                await search.fill(q)
-                await page.keyboard.press("Enter")
+                ok = await self._type_prefix_search_and_submit(
+                        page,
+                        search,
+                        q,
+                        prefix_len=4,              
+                        type_delay_ms=70,
+                        suggestion_timeout_ms=3000,
+                        results_timeout_ms=8000
+                    )
+                if not ok:
+                    continue
             except:
                 continue
 
@@ -486,16 +701,23 @@ class SearchExtractor(BaseExtractor):
             prev_sig = await self.first_result_signature(page)
 
             while True:
+                print("scanning the page")
                 batch = await DirectExtractor().extract(page, keywords)
                 for j in batch:
                     if j["url"] not in seen:
                         seen.add(j["url"])
                         all_results.append(j)
-
+                print(f"📄 Collected {len(batch)} items on this page | total={len(all_results)}")
+                if page_no >= 10:
+                    print("🛑 Reached max pages (20). Stopping pagination.")
+                    #setting page number to 1 to start searching for other key words
+                    page_no = 1
+                    break
                 # Try Next button first
                 if await self.has_next_button(page):
                     ok, prev_sig = await self.click_next(page, prev_sig)
                     if ok:
+                        page_no += 1
                         continue
 
                 # Then try numeric pagination
@@ -503,6 +725,7 @@ class SearchExtractor(BaseExtractor):
                     ok = await self.click_next_page_number(page)
                     if ok:
                         prev_sig = await self.first_result_signature(page)
+                        page_no += 1
                         continue
 
                 break
@@ -583,6 +806,7 @@ class UniversalExtractor(BaseExtractor):
         if res:
             return res
 
+
         # 5) Fallback direct extraction
         print("📄 Using DirectExtractor…")
         return await DirectExtractor().extract(page, keywords)
@@ -606,12 +830,24 @@ async def crawl(url, keywords):
         # Timeouts (Step 6)
         context.set_default_timeout(15000)
         context.set_default_navigation_timeout(45000)
-
+        context = await pw.chromium.launch_persistent_context(
+            user_data_dir="pw-profile",
+            headless=False,
+        )
+        page = await context.new_page()
+        await page.goto("https://www.tesla.com/careers", wait_until="domcontentloaded")
         page = await context.new_page()
 
         print(f"\n🌐 Loading: {url}\n")
         # Safer navigation (Step 6)
-        await page.goto(url, wait_until="domcontentloaded")
+        resp = await page.goto(url, wait_until="domcontentloaded")
+        print("status:", resp.status if resp else None, "final_url:", page.url)
+        title = await page.title()
+        html = await page.content()
+
+        print("title:", title)
+        print("blocked:", ("Access Denied" in html) or ("errors.edgesuite.net" in html))
+        print("len(html):", len(html))
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except:
