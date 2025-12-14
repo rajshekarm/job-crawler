@@ -1,0 +1,50 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.so
+
+# --- Virtual environments ---
+env/
+venv/
+.venv/
+
+# --- VSCode ---
+.vscode/
+*.code-workspace
+
+# --- Playwright browsers ---
+playwright/.cache/
+.playwright/
+browsers/
+ms-playwright/
+
+# --- Environment files ---
+.env
+*.env
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+
+# --- Build / packaging ---
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# --- Testing ---
+.coverage
+coverage.xml
+.cache/
+pytest_cache/
+
+# --- Temporary ---
+tmp/
+temp/
